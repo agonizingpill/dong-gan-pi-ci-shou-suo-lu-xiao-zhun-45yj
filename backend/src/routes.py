@@ -6,8 +6,10 @@ from sqlalchemy.orm import Session
 from . import ledger
 from .auth import identity, issue, require, valid_password
 from .db import session
-from .models import CalibrationRelease, ChamberRun, DryBatch, LabEvent, RecipeLot, Role, User
-from .schemas import BatchIn, CurveIn, DecisionIn, Login, RecipeIn, RetestIn, SampleIn
+from .models import CalibrationRelease, ChamberRun, DryBatch, LabEvent, RecipeLot, Role, TrayPosition, User
+from .schemas import (
+    BatchIn, CurveIn, DecisionIn, Login, PositionIn, RecipeIn, RetestIn, SampleIn,
+)
 
 router = APIRouter()
 operator = require(Role.OPERATOR)
@@ -107,7 +109,16 @@ def batch_detail(code: str, db: Session = Depends(session)):
         readiness = str(exc)
     return {'batch': ledger.row(batch), 'recipe': ledger.row(db.get(RecipeLot, batch.recipe_code)),
             'runs': [ledger.row(run) for run in runs], 'samples': [ledger.row(sample) for sample in samples],
+            'positions': [ledger.row(position) for position in ledger.positions_for(db, code)],
             'calibration': ledger.row(entry) if entry else None, 'readiness_issue': readiness}
+
+
+@router.post('/batches/{code}/positions', status_code=201)
+def register_position(code: str, payload: PositionIn, db: Session = Depends(session), user=Depends(operator)):
+    batch = ledger.locked_batch(db, code)
+    position = ledger.register_position(db, batch, payload.model_dump(), user.username)
+    db.commit()
+    return ledger.row(position)
 
 
 @router.post('/batches/{code}/curves', status_code=201)
@@ -166,9 +177,10 @@ def register(db: Session = Depends(session)):
 def detail(entry_id: int, db: Session = Depends(session)):
     batch, run, entry = calibration_context(db, entry_id)
     events = db.scalars(select(LabEvent).filter_by(batch_code=batch.code).order_by(LabEvent.id.desc()).limit(30))
+    coverage = ledger.plan_coverage(db, entry, run) if entry.position_plan else None
     return {'batch': ledger.row(batch), 'curve': ledger.row(run), 'entry': ledger.row(entry),
             'retest': [ledger.row(sample) for sample in ledger.samples_for(db, run.id, retest=True)],
-            'events': [ledger.row(event) for event in events]}
+            'coverage': coverage, 'events': [ledger.row(event) for event in events]}
 
 
 @router.post('/calibrations/{entry_id}/retry', status_code=202)

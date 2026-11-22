@@ -2,13 +2,15 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StringConstraints, model_validator
 
-from .models import Phase, Stage
+from .models import Phase, Shift, Stage
 
 Code = Annotated[str, StringConstraints(strip_whitespace=True, to_upper=True, pattern=r'^[A-Z0-9][A-Z0-9-]{1,31}$')]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=40)]
 Note = Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=240)]
 Positive = Annotated[FiniteFloat, Field(ge=0.00001, le=200)]
 Percentage = Annotated[FiniteFloat, Field(ge=0, le=100)]
+PositionCode = Annotated[str, StringConstraints(strip_whitespace=True, to_upper=True,
+                                                pattern=r'^[A-Z0-9][A-Z0-9_-]{1,31}$')]
 
 
 class Input(BaseModel):
@@ -66,10 +68,18 @@ class SampleIn(Input):
     specimen: Code
     stage: Stage
     thickness_mm: Positive
+    position: PositionCode | None = None
+
+
+class PositionIn(Input):
+    position: PositionCode
+    door_side: bool = False
 
 
 class RetestIn(Input):
     specimen: Code
+    position: PositionCode
+    shift: Shift
     before_mm: Positive
     after_mm: Positive
     note: Note

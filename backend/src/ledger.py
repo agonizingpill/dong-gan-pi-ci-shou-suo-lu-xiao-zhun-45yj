@@ -10,10 +10,13 @@ from sqlalchemy import inspect, select
 from .db import QUEUE, redis, utcnow
 from .models import (
     BatchState, CalibrationRelease, ChamberRun, DryBatch, LabEvent, Phase, RecipeLot,
-    ReleaseState, RunState, ShrinkageSample, Stage,
+    ReleaseState, RunState, ShrinkageSample, Shift, Stage, TrayPosition,
 )
 
 log = logging.getLogger(__name__)
+
+# 收缩率估计范围距离工艺窗边沿小于该余量（百分点）即视为“碰边”。
+EDGE_MARGIN_PCT = 1.0
 
 
 def checksum(data):
@@ -138,9 +141,14 @@ def add_sample(db, batch, run, payload, actor):
     matches[payload['stage']] = payload['thickness_mm']
     if len(matches) == 2 and matches[Stage.POST] > matches[Stage.PRE]:
         blocked(db, actor, 'sample.record', '冻干后厚度不能大于冻干前读数，请核对试片', batch.code)
+    if payload.get('position') and not db.scalar(
+            select(TrayPosition.id).filter_by(batch_code=batch.code, position=payload['position'])):
+        blocked(db, actor, 'sample.record', f"本批未登记托盘位置 {payload['position']}，请先建档位置", batch.code)
     sample = ShrinkageSample(run_id=run.id, technician=actor, **payload)
     db.add(sample)
-    record(db, actor, 'sample.record', f'{sample.specimen} · {sample.stage} · {sample.thickness_mm:g} mm', batch.code)
+    record(db, actor, 'sample.record',
+           f"{sample.specimen} · {sample.stage} · {sample.thickness_mm:g} mm"
+           f" · {sample.position or '未标位置'}", batch.code)
     db.flush()
     return sample
 
@@ -170,6 +178,156 @@ def observed(pairs):
     return round(sum(100 * (1 - pair[Stage.POST] / pair[Stage.PRE]) for pair in pairs.values()) / len(pairs), 6)
 
 
+def shrinkage_of(before_mm, after_mm):
+    return round(100 * (1 - after_mm / before_mm), 6)
+
+
+def positions_for(db, batch_code):
+    return db.scalars(select(TrayPosition).filter_by(batch_code=batch_code)
+                      .order_by(TrayPosition.door_side.desc(), TrayPosition.position)).all()
+
+
+def register_position(db, batch, payload, actor):
+    if batch.state != BatchState.COLLECTING:
+        blocked(db, actor, 'position.register', '试算提交后托盘位置已冻结，不能再增改', batch.code)
+    if db.scalar(select(TrayPosition.id).filter_by(batch_code=batch.code, position=payload['position'])):
+        blocked(db, actor, 'position.register', '该托盘位置已登记，位置编号不能重复', batch.code)
+    position = TrayPosition(batch_code=batch.code, **payload)
+    db.add(position)
+    record(db, actor, 'position.register',
+           f"{position.position} · {'门侧托盘' if position.door_side else '普通托盘'}", batch.code)
+    db.flush()
+    return position
+
+
+def position_shrinkage_pairs(db, run_id, position):
+    """Shrinkage values of fully paired first-measurement specimens at one position."""
+    pairs = {}
+    for sample in samples_for(db, run_id):
+        if sample.position != position:
+            continue
+        pairs.setdefault(sample.specimen, {})[sample.stage] = round(sample.thickness_mm, 5)
+    values = [observed({specimen: pair}) for specimen, pair in pairs.items() if len(pair) == 2]
+    return sorted(values)
+
+
+def build_position_plan(db, batch, recipe, run):
+    """Build the supplementary-test plan from same-recipe/same-position references.
+
+    Each position is estimated with the shrinkage range of certified reference
+    batches at the same physical location. Positions touching the process window
+    edge or lacking a reference need an independent retest; the rest are pooled.
+    """
+    window = [round(recipe.window_low, 5), round(recipe.window_high, 5)]
+    references = db.scalars(select(DryBatch).filter_by(recipe_code=recipe.code, state=BatchState.REFERENCE)
+                            .order_by(DryBatch.code)).all()
+    ref_runs = [(historical, latest_run(db, historical.code)) for historical in references]
+
+    plan_positions = []
+    for tray in positions_for(db, batch.code):
+        ref_values = []
+        ref_batches = []
+        for historical, ref_run in ref_runs:
+            values = position_shrinkage_pairs(db, ref_run.id, tray.position)
+            if values:
+                ref_values.extend(values)
+                ref_batches.append(historical.code)
+        if not ref_values:
+            basis = 'no_reference'
+            estimate_range = None
+        else:
+            estimate_range = [round(min(ref_values), 6), round(max(ref_values), 6)]
+            low, high = estimate_range
+            edge = (low <= window[0] + EDGE_MARGIN_PCT) or (high >= window[1] - EDGE_MARGIN_PCT)
+            basis = 'window_edge' if edge else 'reference_range'
+        plan_positions.append({
+            'position': tray.position, 'door_side': tray.door_side, 'basis': basis,
+            'reference_batches': ref_batches, 'estimate_range': estimate_range,
+            'requirement': 'independent' if basis in ('no_reference', 'window_edge') else 'pooled',
+        })
+
+    independent = [item['position'] for item in plan_positions if item['requirement'] == 'independent']
+    pooled = [item['position'] for item in plan_positions if item['requirement'] == 'pooled']
+    pool = pooled[0] if pooled else None
+    for item in plan_positions:
+        if item['requirement'] == 'pooled':
+            item['pool_group'] = pool
+    return {'window': window, 'edge_margin_pct': EDGE_MARGIN_PCT,
+            'positions': plan_positions, 'independent_positions': independent,
+            'pooled_positions': pooled, 'pool_group': pool}
+
+
+def retest_rows(db, run_id):
+    """Retest specimens de-duplicated by specimen; latest reading wins."""
+    rows = {}
+    for sample in db.scalars(select(ShrinkageSample).filter_by(run_id=run_id, is_retest=True)
+                             .order_by(ShrinkageSample.id)).all():
+        rows.setdefault(sample.specimen, {'specimen': sample.specimen, 'position': sample.position,
+                                          'shift': sample.shift.value if sample.shift else None,
+                                          'technician': sample.technician, 'stages': {}})
+        rows[sample.specimen]['stages'][sample.stage] = round(sample.thickness_mm, 5)
+        rows[sample.specimen]['recorded_at'] = sample.recorded_at
+    return list(rows.values())
+
+
+def plan_coverage(db, release, run):
+    """Match recorded retests against the frozen plan; wrong-position tests never count."""
+    window = release.snapshot['window']
+    plan = release.position_plan or {'positions': [], 'independent_positions': [],
+                                     'pooled_positions': [], 'pool_group': None}
+    valid_positions = {item['position'] for item in plan['positions']}
+    pool = plan.get('pool_group')
+    covered = {}
+    mispositioned = []
+    for row in retest_rows(db, run.id):
+        pair = row['stages']
+        if Stage.PRE not in pair or Stage.POST not in pair:
+            continue
+        pct = shrinkage_of(pair[Stage.PRE], pair[Stage.POST])
+        verdict = {'specimen': row['specimen'], 'position': row['position'], 'shift': row['shift'],
+                   'technician': row['technician'], 'shrinkage_pct': pct,
+                   'inside': inside(pct, window), 'recorded_at': row['recorded_at']}
+        if row['position'] not in valid_positions:
+            mispositioned.append(verdict)
+            continue
+        covered.setdefault(row['position'], []).append(verdict)
+
+    lines = []
+    missing = []
+    pool_satisfied = {}
+    if pool:
+        pool_satisfied[pool] = any(entry['inside'] for entry in covered.get(pool, []))
+    for item in plan['positions']:
+        position = item['position']
+        entries = covered.get(position, [])
+        in_window = next((entry for entry in entries if entry['inside']), None)
+        any_entry = entries[0] if entries else None
+        if item['requirement'] == 'independent':
+            satisfied = in_window is not None
+            if not satisfied:
+                missing.append(position)
+        else:
+            # 合抽位置共享同一处抽测：在牵头位置测一枚窗内试片即覆盖整组。
+            satisfied = pool_satisfied.get(pool, False)
+            if position == pool and not satisfied:
+                missing.append(f'POOL:{pool}')
+        lines.append({
+            'position': position, 'door_side': item['door_side'], 'basis': item['basis'],
+            'requirement': item['requirement'], 'pool_group': item.get('pool_group'),
+            'estimate_range': item['estimate_range'], 'reference_batches': item['reference_batches'],
+            'retests': entries, 'satisfied': satisfied,
+            'latest_pct': any_entry['shrinkage_pct'] if any_entry else None,
+            'in_window': in_window is not None,
+        })
+    required_count = len(plan['independent_positions']) + (1 if pool else 0)
+    distinct_valid = {entry['specimen'] for entries in covered.values() for entry in entries}
+    complete = not missing
+    all_inside = all(entry['inside'] for entries in covered.values() for entry in entries)
+    return {'lines': lines, 'missing': missing, 'mispositioned': mispositioned,
+            'required_count': required_count, 'valid_specimen_count': len(distinct_valid),
+            'complete': complete, 'all_inside': all_inside}
+
+
 def queue_fit(db, batch, actor):
     if batch.state != BatchState.COLLECTING:
         blocked(db, actor, 'fit.queue', '该批次当前状态不可提交新试算', batch.code)
@@ -179,6 +337,8 @@ def queue_fit(db, batch, actor):
         target_pairs = paired_measurements(db, run)
     except ValueError as exc:
         blocked(db, actor, 'fit.queue', str(exc), batch.code)
+    if not positions_for(db, batch.code):
+        blocked(db, actor, 'fit.queue', '请先登记本批托盘位置，补测计划按位置生成', batch.code)
     reference = db.scalars(select(DryBatch).filter_by(recipe_code=recipe.code, state=BatchState.REFERENCE)
                            .order_by(DryBatch.code)).all()
     if len(reference) < 3:
@@ -199,7 +359,8 @@ def queue_fit(db, batch, actor):
         'features': feature_row(batch, recipe, run), 'sample_pairs': target_pairs,
         'window': [round(recipe.window_low, 5), round(recipe.window_high, 5)], 'training': training,
     }
-    release = CalibrationRelease(run_id=run.id, requested_by=actor, input_hash=checksum(snapshot), snapshot=snapshot)
+    release = CalibrationRelease(run_id=run.id, requested_by=actor, input_hash=checksum(snapshot),
+                                 snapshot=snapshot, position_plan=build_position_plan(db, batch, recipe, run))
     db.add(release)
     batch.state = BatchState.CALIBRATING
     record(db, actor, 'fit.queue', f'{run.source_name} · {release.input_hash}', batch.code)
@@ -230,25 +391,65 @@ def inside(value, window):
 def measure_retest(db, batch, run, release, payload, actor):
     if release.state not in (ReleaseState.AWAITING, ReleaseState.RETEST):
         blocked(db, actor, 'retest.record', '当前校准状态不接受复测', batch.code)
-    if any(item.specimen == payload.specimen for item in samples_for(db, run.id)):
-        blocked(db, actor, 'retest.record', '复测须取独立试片，试片编号不能与首测重复', batch.code)
+    plan = release.position_plan
+    valid_positions = {item['position'] for item in plan['positions']} if plan else set()
+    if payload.position not in valid_positions:
+        blocked(db, actor, 'retest.record',
+                f"本批托盘位置不含 {payload.position}，错位置的补测不能顶数", batch.code)
+    # 同一试片的复测重试允许重测（保留历史行），但不重复计入有效试片数。
+    prior = [item for item in samples_for(db, run.id, retest=True) if item.specimen == payload.specimen]
+    retry = bool(prior)
+    attempt_no = (max(item.attempt_no for item in prior) + 1) if prior else 0
+    if not retry and any(item.specimen == payload.specimen for item in samples_for(db, run.id)):
+        blocked(db, actor, 'retest.record', '补测须取独立试片，试片编号不能与首测重复', batch.code)
     db.add_all([
         ShrinkageSample(run_id=run.id, technician=actor, specimen=payload.specimen, stage=stage,
-                        thickness_mm=reading, is_retest=True)
+                        thickness_mm=reading, is_retest=True, attempt_no=attempt_no,
+                        position=payload.position, shift=payload.shift)
         for stage, reading in [(Stage.PRE, payload.before_mm), (Stage.POST, payload.after_mm)]
     ])
-    release.recheck_pct = round(100 * (1 - payload.after_mm / payload.before_mm), 6)
+    pct = shrinkage_of(payload.before_mm, payload.after_mm)
+    in_window = inside(pct, release.snapshot['window'])
+    release.recheck_pct = pct
     release.recheck_note = payload.note
-    acceptable = release.state == ReleaseState.AWAITING and inside(release.recheck_pct, release.snapshot['window'])
-    release.state = ReleaseState.VERIFIED if acceptable else ReleaseState.HELD
     release.touched_at = utcnow()
-    action = 'retest.verified' if acceptable else 'retest.held'
-    record(db, actor, action, f'{payload.specimen} · {release.recheck_pct:.2f}% · {payload.note}', batch.code)
+    db.flush()
+    coverage = plan_coverage(db, release, run)
+    tag = '重试' if retry else '新试片'
+    record(db, actor, 'retest.record',
+           f"{payload.position} · {payload.specimen} · {payload.shift.value} · {pct:.2f}% · {tag} · {payload.note}",
+           batch.code)
+    if release.state == ReleaseState.RETEST:
+        # 预测已超窗的周期：任何补测都不能翻案，按规则留置整批，另开周期再评估。
+        release.state = ReleaseState.HELD
+        verdict = '实测超窗' if not in_window else '预测超窗，补测仅留档'
+        record(db, actor, 'retest.held', f'{payload.specimen} {verdict}，整批留置', batch.code)
+        return coverage
+    if not in_window:
+        # 预测窗内但某处补测超窗：先留档，签发时整批留置。
+        record(db, actor, 'retest.out_of_window',
+               f'{payload.position} 补测 {pct:.2f}% 超窗，签发将留置整批', batch.code)
+        return coverage
+    if coverage['complete'] and coverage['all_inside']:
+        release.state = ReleaseState.VERIFIED
+        record(db, actor, 'retest.verified',
+               f"补测齐 {coverage['required_count']} 处且均在窗内，待主管签发", batch.code)
+    return coverage
 
 
 def sign_release(db, batch, run, release, actor, note):
-    if release.state != ReleaseState.VERIFIED or run.state != RunState.FROZEN or latest_run(db, batch.code).id != run.id:
-        blocked(db, actor, 'release.sign', '仅窗内且已复测确认的当前冻结曲线允许签发', batch.code)
+    if run.state != RunState.FROZEN or latest_run(db, batch.code).id != run.id:
+        blocked(db, actor, 'release.sign', '仅当前冻结曲线允许签发', batch.code)
+    if release.state == ReleaseState.RELEASED:
+        blocked(db, actor, 'release.sign', '该批次已签发', batch.code)
+    if release.state not in (ReleaseState.VERIFIED, ReleaseState.AWAITING):
+        blocked(db, actor, 'release.sign', '当前校准状态不接受签发', batch.code)
+    coverage = plan_coverage(db, release, run)
+    if not coverage['complete'] or not coverage['all_inside']:
+        release.state = ReleaseState.HELD
+        release.touched_at = utcnow()
+        missing = '、'.join(coverage['missing']) or '存在超窗补测'
+        blocked(db, actor, 'release.sign', f'补测未齐或存在超窗（{missing}），整批留置', batch.code)
     release.state = ReleaseState.RELEASED
     release.signed_at = utcnow()
     release.signed_by = actor

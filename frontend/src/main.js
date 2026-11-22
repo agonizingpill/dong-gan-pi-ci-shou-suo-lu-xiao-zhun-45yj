@@ -105,6 +105,12 @@ const commands = {
     await draw();
     toast('设备曲线已冻结，可开始录入试片');
   },
+  registerPosition: async data => {
+    await api.registerPosition(store.batch.batch.code, data);
+    await draw();
+    document.querySelector('form[data-action="registerPosition"]')?.closest('details')?.setAttribute('open', '');
+    toast('托盘位置已登记');
+  },
   sample: async data => {
     await api.sample(store.batch.batch.code, store.batch.runs[0].id, data);
     await draw();
@@ -153,7 +159,10 @@ async function execute(action, payload, button) {
 root.addEventListener('submit', event => {
   event.preventDefault();
   const form = event.target;
-  execute(form.dataset.action, Object.fromEntries(new FormData(form)), event.submitter);
+  const payload = Object.fromEntries(new FormData(form));
+  if (form.dataset.action === 'registerPosition') payload.door_side = form.elements.door_side?.checked ?? false;
+  if (form.dataset.action === 'sample' && payload.position === '') payload.position = null;
+  execute(form.dataset.action, payload, event.submitter);
 });
 root.addEventListener('click', event => {
   const button = event.target.closest('button');

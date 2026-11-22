@@ -23,6 +23,12 @@ class Phase(StrEnum):
     FINISH = 'finish'
 
 
+class Shift(StrEnum):
+    MORNING = 'morning'
+    EVENING = 'evening'
+    NIGHT = 'night'
+
+
 class BatchState(StrEnum):
     COLLECTING = 'collecting'
     REFERENCE = 'reference'
@@ -79,6 +85,16 @@ class DryBatch(Base):
     state: Mapped[BatchState] = mapped_column(enum(BatchState), default=BatchState.COLLECTING)
 
 
+class TrayPosition(Base):
+    """A physical tray location in the chamber, e.g. the door-side tray."""
+    __tablename__ = 'tray_positions'
+    __table_args__ = (UniqueConstraint('batch_code', 'position'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_code: Mapped[str] = mapped_column(ForeignKey('dry_batches.code'), index=True)
+    position: Mapped[str] = mapped_column(String(32))
+    door_side: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class ChamberRun(Base):
     __tablename__ = 'chamber_runs'
     __table_args__ = (UniqueConstraint('batch_code', 'source_name'),)
@@ -94,7 +110,7 @@ class ChamberRun(Base):
 class ShrinkageSample(Base):
     __tablename__ = 'shrinkage_samples'
     __table_args__ = (
-        UniqueConstraint('run_id', 'specimen', 'stage'), CheckConstraint('thickness_mm > 0'),
+        UniqueConstraint('run_id', 'specimen', 'stage', 'attempt_no'), CheckConstraint('thickness_mm > 0'),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey('chamber_runs.id'), index=True)
@@ -102,6 +118,9 @@ class ShrinkageSample(Base):
     stage: Mapped[Stage] = mapped_column(enum(Stage))
     thickness_mm: Mapped[float] = mapped_column(Double)
     is_retest: Mapped[bool] = mapped_column(Boolean, default=False)
+    attempt_no: Mapped[int] = mapped_column(default=0)
+    position: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    shift: Mapped[Shift | None] = mapped_column(enum(Shift), nullable=True)
     technician: Mapped[str] = mapped_column(String(32))
     recorded_at = mapped_column(DateTime(), default=utcnow)
 
@@ -119,6 +138,7 @@ class CalibrationRelease(Base):
     prediction_pct: Mapped[float | None] = mapped_column(Double)
     recheck_pct: Mapped[float | None] = mapped_column(Double)
     recheck_note: Mapped[str | None] = mapped_column(String(240))
+    position_plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     release_note: Mapped[str | None] = mapped_column(String(240))
     signed_by: Mapped[str | None] = mapped_column(String(32))
     signed_at = mapped_column(DateTime(), nullable=True)

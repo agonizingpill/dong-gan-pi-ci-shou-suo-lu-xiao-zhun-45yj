@@ -35,6 +35,7 @@ export const api = {
   createBatch: data => request('/batches', 'POST', data),
   createRecipe: data => request('/recipes', 'POST', data),
   importCurve: (code, data) => request(`${batchPath(code)}/curves`, 'POST', data),
+  registerPosition: (code, data) => request(`${batchPath(code)}/positions`, 'POST', data),
   freeze: (code, id) => request(`${curvePath(code, id)}/freeze`, 'POST'),
   sample: (code, id, data) => request(`${curvePath(code, id)}/samples`, 'POST', data),
   archive: (code, data) => request(`${batchPath(code)}/archive`, 'POST', data),

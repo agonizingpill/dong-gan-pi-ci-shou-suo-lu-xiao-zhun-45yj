@@ -31,11 +31,27 @@ function importForm() {
     <button class="primary">保存为待冻结曲线</button></form></details>`;
 }
 
-function sampleForm() {
+function positionForm(detail) {
+  const known = new Set(detail.positions.map(item => item.position));
+  return `<details class="entry-form"><summary>登记托盘位置</summary><form data-action="registerPosition">
+    <label>位置编号<input name="position" placeholder="TRAY-F" required></label>
+    <label class="checkline"><input type="checkbox" name="door_side" value="true"> 门侧托盘（靠舱门）</label>
+    <button class="primary">登记位置</button></form>
+    ${known.size ? `<ul class="position-chips">${detail.positions.map(item =>
+      `<li><span class="mono">${h(item.position)}</span>${item.door_side ? '<em>门侧</em>' : ''}</li>`).join('')}</ul>` : ''}
+    </details>`;
+}
+
+function sampleForm(detail) {
+  const positions = detail.positions || [];
   return `<details class="entry-form"><summary>录入阶段测量</summary><form data-action="sample">
     <label>试片编号<input name="specimen" placeholder="TRAY-D" required></label>
     <label>阶段<select name="stage">${Object.entries(stages).map(([key, name]) => `<option value="${key}">${name}</option>`).join('')}</select></label>
     <label>厚度 mm<input name="thickness_mm" type="number" step="0.00001" min="0.00001" max="200" required></label>
+    <label>托盘位置<select name="position">
+      <option value="">未标位置</option>
+      ${positions.map(item => `<option value="${h(item.position)}">${h(item.position)}${item.door_side ? '（门侧）' : ''}</option>`).join('')}
+    </select></label>
     <button class="primary">登记读数</button></form></details>`;
 }
 
@@ -46,8 +62,10 @@ function samplesTable(samples) {
     pairs.get(sample.specimen)[sample.stage] = sample;
   }
   if (!pairs.size) return '<p class="empty">冻结曲线后，至少为两枚试片登记冻干前、冻干后厚度。</p>';
-  return `<table><thead><tr><th>试片编号</th><th>冻干前 mm</th><th>冻干后 mm</th><th>登记人</th></tr></thead><tbody>
-    ${[...pairs].map(([specimen, readings]) => `<tr><th class="mono">${h(specimen)}</th><td>${number(readings.pre?.thickness_mm, 3)}</td>
+  return `<table><thead><tr><th>试片编号</th><th>托盘位置</th><th>冻干前 mm</th><th>冻干后 mm</th><th>登记人</th></tr></thead><tbody>
+    ${[...pairs].map(([specimen, readings]) => `<tr><th class="mono">${h(specimen)}</th>
+    <td>${h((readings.post || readings.pre).position || '—')}</td>
+    <td>${number(readings.pre?.thickness_mm, 3)}</td>
     <td>${number(readings.post?.thickness_mm, 3)}</td><td>${h((readings.post || readings.pre).technician)}</td></tr>`).join('')}</tbody></table>`;
 }
 
@@ -88,7 +106,8 @@ export function batchesPage() {
       ${detail.readiness_issue ? `<p class="callout warning">${h(detail.readiness_issue)}</p>` : ''}
       ${curveCard(detail, operator)}
       <section class="sheet readings">${sectionTitle('试片厚度测量', '按试片编号配对')}${samplesTable(detail.samples)}
-      ${operator && detail.runs[0]?.state === 'frozen' && detail.batch.state === 'collecting' ? sampleForm() : ''}
+      ${operator && detail.runs[0]?.state === 'frozen' && detail.batch.state === 'collecting' ? sampleForm(detail) : ''}
+      ${operator && detail.batch.state === 'collecting' ? positionForm(detail) : ''}
       ${supervisor && detail.batch.state === 'collecting' && !detail.readiness_issue ? `<details class="entry-form"><summary>认证为历史标定批次</summary>
       <form data-action="archive"><label class="wide">认证依据<input name="note" minlength="4" required></label><button class="primary">认证参考批次</button></form></details>` : ''}</section>
       </div>` : '<p class="empty">登记第一批冻干物料，随后导入曲线。</p>'}</div>`;

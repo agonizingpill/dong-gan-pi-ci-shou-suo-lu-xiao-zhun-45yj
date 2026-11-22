@@ -152,6 +152,31 @@ form button { justify-self: start; }
 .quick-accounts { display: flex; flex-wrap: wrap; gap: 5px; }
 .quick-accounts button { color: var(--blue); background: var(--ground); border: 1px solid var(--line); padding: 4px 7px; font-size: .73rem; }
 .login-wrap footer { color: var(--muted); font-size: .81rem; }
+
+/* 托盘位置补测计划 */
+.position-plan table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+.position-plan th, .position-plan td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.position-plan thead th { color: var(--muted); font-weight: 600; font-size: .74rem; }
+.position-plan tr.door-row { background: var(--amber-wash); }
+.position-plan th em { font-style: normal; color: var(--amber); font-size: .7rem; margin-left: 4px; }
+.position-plan td small { display: block; color: var(--muted); font-size: .7rem; margin-top: 2px; }
+.plan-rule { color: var(--muted); font-size: .82rem; margin-bottom: 12px; }
+.plan-state { font-weight: 650; font-size: .76rem; white-space: nowrap; }
+.plan-state.satisfied { color: var(--teal); }
+.plan-state.held { color: var(--amber); }
+.plan-state.pending { color: var(--muted); }
+.retest-chip { display: inline-block; background: var(--ground); border: 1px solid var(--line); border-radius: 4px;
+  padding: 2px 6px; margin: 2px 3px 2px 0; font-size: .73rem; white-space: nowrap; }
+.retest-chip.ok { color: var(--teal); border-color: oklch(85% .05 174); }
+.retest-chip.bad { color: var(--amber); border-color: oklch(85% .1 74); background: var(--amber-wash); }
+.muted { color: var(--muted); }
+.callout.ok { background: var(--teal-wash); color: var(--teal); border-left-color: var(--teal); }
+.position-chips { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 10px 0 0; }
+.position-chips li { background: var(--ground); border: 1px solid var(--line); border-radius: 4px; padding: 3px 8px; font-size: .76rem; }
+.position-chips em { font-style: normal; color: var(--amber); margin-left: 5px; }
+.checkline { flex-direction: row; align-items: center; gap: 7px; }
+.checkline input { width: auto; }
+
 @media (max-width: 1100px) {
   .top-inner { gap: 24px; padding-inline: 25px; }.workspace { padding-inline: 25px; }
   .bench { grid-template-columns: 247px minmax(0, 1fr); gap: 16px; }

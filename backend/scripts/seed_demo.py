@@ -6,9 +6,15 @@ from sqlalchemy.orm import Session as OrmSession
 from src.auth import password_hash
 from src.db import engine
 from src.ledger import checksum, queue_fit
-from src.models import BatchState, ChamberRun, DryBatch, RecipeLot, Role, RunState, ShrinkageSample, Stage, User
+from src.models import (
+    BatchState, ChamberRun, DryBatch, RecipeLot, Role, RunState, ShrinkageSample, Stage,
+    TrayPosition, User,
+)
 
 STAMP = datetime(2026, 11, 21, 0, 0)
+
+# 五个托盘位置，TRAY-D 为门侧托盘；TRAY-B 在目标批缺同位置参考。
+TRAY_LAYOUT = [('TRAY-A', False), ('TRAY-B', False), ('TRAY-C', False), ('TRAY-D', True), ('TRAY-E', False)]
 
 
 def points(minutes, pressure, temp, *, vacuum=True):
@@ -19,6 +25,12 @@ def points(minutes, pressure, temp, *, vacuum=True):
                    (60 + minutes, 'vacuum', temp + 4, pressure - 6)]
     series += [(90 + minutes, 'finish', 9.0, 14.0), (130 + minutes, 'finish', 22.0, 10.0)]
     return [dict(minute=m, phase=phase, shelf_c=t, pressure_pa=p) for m, phase, t, p in series]
+
+
+def add_pair(db, run_id, specimen, position, feed, shrinkage):
+    for stage, reading in [(Stage.PRE, feed), (Stage.POST, round(feed * (1 - shrinkage / 100), 5))]:
+        db.add(ShrinkageSample(run_id=run_id, specimen=specimen, stage=stage, thickness_mm=reading,
+                               position=position, technician='operator', recorded_at=STAMP))
 
 
 def seed(db):
@@ -50,6 +62,8 @@ def seed(db):
                          feed_mm=feed, state=state)
         db.add(batch)
         db.flush()
+        for position, door_side in TRAY_LAYOUT:
+            db.add(TrayPosition(batch_code=code, position=position, door_side=door_side))
         if code in ('FD-1121B', 'FD-1121C'):
             db.add(ChamberRun(batch_code=code, source_name=f'{code}_chamber_r0.csv', state=RunState.DRAFT,
                               points=points(minutes, pressure, temp, vacuum=False)))
@@ -61,10 +75,27 @@ def seed(db):
                          points=readings, checksum=checksum(readings), frozen_at=STAMP)
         db.add(run)
         db.flush()
-        for specimen, delta in [('TRAY-A', -0.4), ('TRAY-C', 0.4)]:
-            for stage, reading in [(Stage.PRE, feed), (Stage.POST, round(feed * (1 - (shrinkage + delta) / 100), 5))]:
-                db.add(ShrinkageSample(run_id=run.id, specimen=specimen, stage=stage, thickness_mm=reading,
-                                       technician='operator', recorded_at=STAMP))
+        if state == BatchState.REFERENCE:
+            # 同位置参考：普通托盘稳定落在工艺窗内；门侧 TRAY-D 贴近上沿 16%；TRAY-B 无同位置参考。
+            reference_layout = {
+                'FD-1101': {'TRAY-A': 10.8, 'TRAY-C': 11.2, 'TRAY-D': 15.1, 'TRAY-E': 10.6},
+                'FD-1104': {'TRAY-A': 12.4, 'TRAY-C': 12.8, 'TRAY-D': 15.4, 'TRAY-E': 12.0},
+                'FD-1108': {'TRAY-A': 13.6, 'TRAY-C': 14.2, 'TRAY-D': 15.7, 'TRAY-E': 13.2},
+            }
+            for specimen, value in reference_layout[code].items():
+                add_pair(db, run.id, specimen, specimen, feed, value)
+        elif code == 'FD-1121A':
+            # 整批预测合格，但门侧托盘 TRAY-D 首测超窗（17.2% > 16%）。
+            target_specimens = [
+                ('TRAY-A', 'TRAY-A', shrinkage - 0.4),
+                ('TRAY-C', 'TRAY-C', shrinkage + 0.4),
+                ('TRAY-D', 'TRAY-D', 17.2),
+            ]
+            for specimen, position, value in target_specimens:
+                add_pair(db, run.id, specimen, position, feed, value)
+        else:
+            for specimen, delta in [('TRAY-A', -0.4), ('TRAY-C', 0.4)]:
+                add_pair(db, run.id, specimen, specimen, feed, shrinkage + delta)
         db.flush()
         if code in ('FD-1121A', 'FD-1121C'):
             queue_fit(db, batch, 'operator')
